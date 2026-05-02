@@ -285,14 +285,14 @@ def abaqus_available() -> bool:
 def checkpoint_path(n_fibers: int, arch: str = "attention_unet",
                     pretrain_tag: str = "scratch", seed: int | None = None) -> str:
     suffix = f"_seed{seed}" if seed is not None else ""
-    return str(ROOT / "outputs" / "checkpoints" /
+    return str(Path("outputs") / "checkpoints" /
                f"best_{arch}_nf{n_fibers}_{pretrain_tag}{suffix}.pth")
 
 
 def log_path(n_fibers: int, arch: str = "attention_unet",
              pretrain_tag: str = "scratch", seed: int | None = None) -> str:
     suffix = f"_seed{seed}" if seed is not None else ""
-    return str(ROOT / "outputs" / "checkpoints" /
+    return str(Path("outputs") / "checkpoints" /
                f"log_{arch}_nf{n_fibers}_{pretrain_tag}{suffix}.json")
 
 
@@ -622,16 +622,16 @@ def step7_ablation(dry_run: bool, epochs: int, seeds: list[int]) -> None:
 """)
 
     ablations = [
-        {"arch": "unet",           "alpha": 1.0, "beta": 0.0,
+        {"arch": "unet",           "alpha": 1.0, "beta": 0.0, "gamma": 0.0,
          "tag": "unet_mse",        "desc": "Baseline U-Net, pure MSE"},
-        {"arch": "attention_unet", "alpha": 1.0, "beta": 0.0,
+        {"arch": "attention_unet", "alpha": 1.0, "beta": 0.0, "gamma": 4.0,
          "tag": "attn_wmse",       "desc": "AttentionUNet, Weighted MSE only"},
-        {"arch": "unet",           "alpha": 0.7, "beta": 0.3,
+        {"arch": "unet",           "alpha": 0.7, "beta": 0.3, "gamma": 4.0,
          "tag": "unet_combined",   "desc": "Baseline U-Net, combined loss"},
-        {"arch": "resnet34_attention_unet", "alpha": 0.7, "beta": 0.3,
+        {"arch": "resnet34_attention_unet", "alpha": 0.7, "beta": 0.3, "gamma": 4.0,
          "tag": "resnet34_attn_combined", "desc": "ResNet34 Attention U-Net, combined loss",
          "extra": "--resnet_pretrained"},
-        {"arch": "cnn", "alpha": 0.7, "beta": 0.3,
+        {"arch": "cnn", "alpha": 0.7, "beta": 0.3, "gamma": 4.0,
          "tag": "cnn_combined", "desc": "CNN baseline, combined loss"},
     ]
 
@@ -644,7 +644,7 @@ def step7_ablation(dry_run: bool, epochs: int, seeds: list[int]) -> None:
                 f"  --n_fibers 6"
                 f"  --arch {ab['arch']}"
                 f"  --epochs {epochs}"
-                f"  --alpha {ab['alpha']}  --beta {ab['beta']}"
+                f"  --alpha {ab['alpha']}  --beta {ab['beta']}  --gamma {ab['gamma']}"
                 f"  --seed {seed}"
                 f"  {extra}"
                 f"  --run_name {ab['tag']}_nf6_seed{seed}",
@@ -750,7 +750,7 @@ def step9_visualise_results(dry_run: bool) -> None:
     training_curves_{run_name}.png — loss + SSIM vs epoch + LR schedule
 """)
 
-    ckpt_dir = ROOT / "outputs" / "checkpoints"
+    ckpt_dir = Path("outputs") / "checkpoints"
     if not ckpt_dir.exists() and not dry_run:
         print("  No checkpoints found — skipping.")
         return

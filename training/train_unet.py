@@ -73,7 +73,9 @@ def load_dataset(npz_path: str):
     Y       = data["Y"]                          # (N, 1, H, W) raw Pa
     Y_min   = float(data["Y_global_min"])
     Y_max   = float(data["Y_global_max"])
-    return X, Y, Y_min, Y_max
+    sample_ids = data["sample_ids"] if "sample_ids" in data.files else None
+    aug_ids    = data["aug_ids"]    if "aug_ids"    in data.files else None
+    return X, Y, Y_min, Y_max, sample_ids, aug_ids
 
 
 # ============================================================================
@@ -348,7 +350,13 @@ def main():
     parser.add_argument("--train_frac",  type=float, default=0.80)
     parser.add_argument("--val_frac",    type=float, default=0.10)
     parser.add_argument("--train_samples", type=int, default=None,
-                        help="Limit number of training samples (for low-data transfer sweeps)")
+                        help="Limit number of UNIQUE training simulations (pre-augmentation) "
+                             "(for low-data transfer sweeps)")
+    parser.add_argument("--split_policy", type=str, default="group",
+                        choices=["group", "image"],
+                        help="Train/val/test split policy (default: group). "
+                             "'group' keeps all augmentations of a sample_id in the same split; "
+                             "'image' is legacy image-level random split.")
 
     # Model
     parser.add_argument("--arch",          type=str,  default="attention_unet",
@@ -422,49 +430,126 @@ def main():
         sys.exit(1)
 
     print(f"\nLoading       : {npz_path}")
-    X, Y, Y_min, Y_max = load_dataset(npz_path)
+    X, Y, Y_min, Y_max, sample_ids, aug_ids = load_dataset(npz_path)
     print(f"  Total samples : {len(X)}")
     print(f"  X shape       : {X.shape}")
     print(f"  Y range       : {Y_min:.3e} – {Y_max:.3e} Pa")
 
     dataset = StressDataset(X, Y, Y_min, Y_max)
 
+    split_info = {
+        "policy": args.split_policy,
+        "train_sample_ids": None,
+        "val_sample_ids": None,
+        "test_sample_ids": None,
+        "train_sample_ids_used": None,
+    }
+
     if args.train_frac + args.val_frac >= 1.0:
         print("ERROR: train_frac + val_frac must be < 1.0 to leave room for test set.",
               file=sys.stderr)
         sys.exit(1)
 
-    n_total = len(dataset)
-    n_train = int(args.train_frac * n_total)
-    n_val   = int(args.val_frac   * n_total)
-    n_test  = n_total - n_train - n_val
+    train_ds = val_ds = test_ds = None
+    if args.split_policy == "group" and sample_ids is not None:
+        sample_ids = np.asarray(sample_ids)
+        unique_ids = np.unique(sample_ids)
+        if len(unique_ids) >= 3:
+            rng = np.random.default_rng(args.seed)
+            rng.shuffle(unique_ids)
 
-    # Ensure at least 1 sample in each split
-    if n_val < 1:
-        n_val = 1
-    if n_test < 1:
-        n_test = 1
-    n_train = n_total - n_val - n_test
-    if n_train < 1:
-        print("ERROR: dataset too small for train/val/test split "
-              f"(n_total={n_total}).", file=sys.stderr)
-        sys.exit(1)
+            n_unique = len(unique_ids)
+            n_train_u = int(args.train_frac * n_unique)
+            n_val_u   = int(args.val_frac   * n_unique)
+            n_test_u  = n_unique - n_train_u - n_val_u
 
-    train_ds, val_ds, test_ds = random_split(
-        dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
+            # Ensure at least 1 unique simulation in each split.
+            if n_val_u < 1:
+                n_val_u = 1
+            if n_test_u < 1:
+                n_test_u = 1
+            n_train_u = n_unique - n_val_u - n_test_u
+            if n_train_u < 1:
+                print("ERROR: not enough unique samples for grouped split "
+                      f"(n_unique={n_unique}).", file=sys.stderr)
+                sys.exit(1)
 
-    if args.train_samples is not None:
-        n_use = max(1, min(args.train_samples, len(train_ds)))
-        subset_idx = torch.randperm(
-            len(train_ds),
-            generator=torch.Generator().manual_seed(args.seed + 101)
-        )[:n_use].tolist()
-        train_ds = Subset(train_ds, subset_idx)
-        print(f"  Train subset  : {len(train_ds)} samples (requested {args.train_samples})")
+            train_ids = unique_ids[:n_train_u]
+            val_ids   = unique_ids[n_train_u:n_train_u + n_val_u]
+            test_ids  = unique_ids[n_train_u + n_val_u:]
 
-    print(f"  Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+            # Optional low-data restriction in terms of unique simulation count.
+            train_ids_used = train_ids
+            if args.train_samples is not None:
+                n_use = max(1, min(int(args.train_samples), len(train_ids)))
+                if n_use < len(train_ids):
+                    rng2 = np.random.default_rng(args.seed + 101)
+                    train_ids_used = rng2.choice(train_ids, size=n_use, replace=False)
+                else:
+                    train_ids_used = train_ids
+
+            train_idx = np.nonzero(np.isin(sample_ids, train_ids_used))[0]
+            val_idx   = np.nonzero(np.isin(sample_ids, val_ids))[0]
+            test_idx  = np.nonzero(np.isin(sample_ids, test_ids))[0]
+
+            train_ds = Subset(dataset, train_idx.tolist())
+            val_ds   = Subset(dataset, val_idx.tolist())
+            test_ds  = Subset(dataset, test_idx.tolist())
+
+            split_info.update({
+                "policy": "group",
+                "train_sample_ids": sorted(int(x) for x in train_ids.tolist()),
+                "val_sample_ids": sorted(int(x) for x in val_ids.tolist()),
+                "test_sample_ids": sorted(int(x) for x in test_ids.tolist()),
+                "train_sample_ids_used": sorted(int(x) for x in np.asarray(train_ids_used).tolist()),
+            })
+
+            print(f"  Unique sims    : {n_unique}")
+            print(f"  Split sims     : {len(train_ids_used)}/{len(val_ids)}/{len(test_ids)} (train/val/test)")
+            print(f"  Split images   : {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+        else:
+            print("WARNING: dataset has too few unique sample_ids for grouped split; "
+                  "falling back to image-level split.")
+
+    if train_ds is None or val_ds is None or test_ds is None:
+        split_info.update({
+            "policy": "image",
+            "train_sample_ids": None,
+            "val_sample_ids": None,
+            "test_sample_ids": None,
+            "train_sample_ids_used": None,
+        })
+        n_total = len(dataset)
+        n_train = int(args.train_frac * n_total)
+        n_val   = int(args.val_frac   * n_total)
+        n_test  = n_total - n_train - n_val
+
+        # Ensure at least 1 sample in each split
+        if n_val < 1:
+            n_val = 1
+        if n_test < 1:
+            n_test = 1
+        n_train = n_total - n_val - n_test
+        if n_train < 1:
+            print("ERROR: dataset too small for train/val/test split "
+                  f"(n_total={n_total}).", file=sys.stderr)
+            sys.exit(1)
+
+        train_ds, val_ds, test_ds = random_split(
+            dataset, [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+
+        if args.train_samples is not None:
+            n_use = max(1, min(int(args.train_samples), len(train_ds)))
+            subset_idx = torch.randperm(
+                len(train_ds),
+                generator=torch.Generator().manual_seed(args.seed + 101)
+            )[:n_use].tolist()
+            train_ds = Subset(train_ds, subset_idx)
+            print(f"  Train subset  : {len(train_ds)} images (requested {args.train_samples})")
+
+        print(f"  Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
 
     train_gen = torch.Generator().manual_seed(args.seed + 202)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
@@ -593,6 +678,7 @@ def main():
         "args":       vars(args),
         "best_val_loss": best_val_loss,
         "test_metrics":  metrics,
+        "split":         split_info,
         "history":       history,
     }
     with open(log_path, "w") as f:

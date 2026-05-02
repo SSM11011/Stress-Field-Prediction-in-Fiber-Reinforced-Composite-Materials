@@ -255,6 +255,20 @@ def _load_model_from_checkpoint(ckpt_path: Path):
     return model
 
 
+def _load_test_sample_ids_from_log(log_path: Path) -> list[int] | None:
+    """Return test sample_ids from a training log, if present."""
+    try:
+        with open(log_path, "r") as f:
+            log = json.load(f)
+        split = log.get("split", {})
+        test_ids = split.get("test_sample_ids")
+        if not test_ids:
+            return None
+        return [int(x) for x in test_ids]
+    except Exception:
+        return None
+
+
 def generate_qualitative_figures(rows: list[dict], n_show: int) -> None:
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -276,29 +290,49 @@ def generate_qualitative_figures(rows: list[dict], n_show: int) -> None:
         y_min = float(data["Y_global_min"])
         y_max = float(data["Y_global_max"])
 
-        x_t = torch.tensor(X, dtype=torch.float32).to(device)
+        sample_ids = data["sample_ids"] if "sample_ids" in data.files else None
+        aug_ids    = data["aug_ids"]    if "aug_ids"    in data.files else None
+
+        # Prefer test-set qualitative analysis (avoids train/val contamination).
+        sel_idx = np.arange(len(X))
+        test_ids = _load_test_sample_ids_from_log(Path(best["log_path"]))
+        if test_ids is not None and sample_ids is not None:
+            mask = np.isin(sample_ids, np.asarray(test_ids))
+            idx = np.nonzero(mask)[0]
+            if len(idx):
+                sel_idx = idx
+
+        X_sel = X[sel_idx]
+        Y_sel = Y[sel_idx]
+        sids_sel = sample_ids[sel_idx] if sample_ids is not None else None
+        augs_sel = aug_ids[sel_idx] if aug_ids is not None else None
+
+        x_t = torch.tensor(X_sel, dtype=torch.float32).to(device)
         with torch.no_grad():
             pred_n = model(x_t).cpu().numpy()
 
         pred = pred_n * (y_max - y_min) + y_min
-        err = np.abs(pred - Y)
+        err = np.abs(pred - Y_sel)
         err_max = err.reshape(err.shape[0], -1).max(axis=1)
 
-        top_idx = np.argsort(-err_max)[:n_show]
+        top_local = np.argsort(-err_max)[:n_show]
 
-        fig, axes = plt.subplots(len(top_idx), 3, figsize=(10, 3.2 * len(top_idx)))
-        if len(top_idx) == 1:
+        fig, axes = plt.subplots(len(top_local), 3, figsize=(10, 3.2 * len(top_local)))
+        if len(top_local) == 1:
             axes = axes[np.newaxis, :]
 
-        for row_i, idx in enumerate(top_idx):
-            micro = X[idx, 0]
-            gt = Y[idx, 0] / 1e6
-            pr = pred[idx, 0] / 1e6
+        for row_i, j in enumerate(top_local):
+            micro = X_sel[j, 0]
+            gt = Y_sel[j, 0] / 1e6
+            pr = pred[j, 0] / 1e6
             ae = np.abs(gt - pr)
             vmax = max(float(gt.max()), float(pr.max()))
 
             axes[row_i, 0].imshow(micro, cmap="gray", vmin=0, vmax=1)
-            axes[row_i, 0].set_title(f"Sample {idx} input")
+            if sids_sel is not None and augs_sel is not None:
+                axes[row_i, 0].set_title(f"s{sids_sel[j]} a{augs_sel[j]}")
+            else:
+                axes[row_i, 0].set_title(f"Index {int(sel_idx[j])}")
             axes[row_i, 0].axis("off")
 
             im1 = axes[row_i, 1].imshow(gt, cmap="jet", vmin=0, vmax=vmax)
