@@ -28,6 +28,7 @@ import os
 import json
 import argparse
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -379,6 +380,8 @@ def main():
     parser.add_argument("--batch_size", type=int,  default=16)
     parser.add_argument("--lr",        type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--seed",      type=int,   default=42,
+                        help="Random seed for reproducibility (default: 42)")
 
     # Output
     parser.add_argument("--out_dir",   type=str,  default="outputs/checkpoints")
@@ -387,9 +390,19 @@ def main():
 
     args = parser.parse_args()
 
+    # ── Reproducibility ──────────────────────────────────────────────────────
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     # ── Device ──────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device        : {device}")
+    print(f"Seed          : {args.seed}")
 
     # ── Run name ────────────────────────────────────────────────────────────
     pretrain_tag = "tl" if args.pretrained else "scratch"
@@ -439,22 +452,24 @@ def main():
 
     train_ds, val_ds, test_ds = random_split(
         dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(42)
+        generator=torch.Generator().manual_seed(args.seed)
     )
 
     if args.train_samples is not None:
         n_use = max(1, min(args.train_samples, len(train_ds)))
         subset_idx = torch.randperm(
             len(train_ds),
-            generator=torch.Generator().manual_seed(7)
+            generator=torch.Generator().manual_seed(args.seed + 101)
         )[:n_use].tolist()
         train_ds = Subset(train_ds, subset_idx)
         print(f"  Train subset  : {len(train_ds)} samples (requested {args.train_samples})")
 
     print(f"  Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
 
+    train_gen = torch.Generator().manual_seed(args.seed + 202)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True,  num_workers=0, pin_memory=True)
+                              shuffle=True,  num_workers=0, pin_memory=True,
+                              generator=train_gen)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=0, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size,

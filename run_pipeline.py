@@ -241,6 +241,13 @@ def banner(title: str) -> None:
     print("=" * width)
 
 
+def parse_seed_list(seed_csv: str) -> list[int]:
+    seeds = [int(s.strip()) for s in seed_csv.split(",") if s.strip()]
+    if not seeds:
+        raise ValueError("At least one seed must be provided.")
+    return seeds
+
+
 def run(cmd: str, dry_run: bool = False, check: bool = True) -> bool:
     """
     Print and optionally execute a shell command.
@@ -276,15 +283,17 @@ def abaqus_available() -> bool:
 
 
 def checkpoint_path(n_fibers: int, arch: str = "attention_unet",
-                    pretrain_tag: str = "scratch") -> str:
+                    pretrain_tag: str = "scratch", seed: int | None = None) -> str:
+    suffix = f"_seed{seed}" if seed is not None else ""
     return str(ROOT / "outputs" / "checkpoints" /
-               f"best_{arch}_nf{n_fibers}_{pretrain_tag}.pth")
+               f"best_{arch}_nf{n_fibers}_{pretrain_tag}{suffix}.pth")
 
 
 def log_path(n_fibers: int, arch: str = "attention_unet",
-             pretrain_tag: str = "scratch") -> str:
+             pretrain_tag: str = "scratch", seed: int | None = None) -> str:
+    suffix = f"_seed{seed}" if seed is not None else ""
     return str(ROOT / "outputs" / "checkpoints" /
-               f"log_{arch}_nf{n_fibers}_{pretrain_tag}.json")
+               f"log_{arch}_nf{n_fibers}_{pretrain_tag}{suffix}.json")
 
 
 # ===========================================================================
@@ -538,7 +547,7 @@ def step5_visualise_data(dry_run: bool) -> None:
 # Step 6  — Train base models (source domains: 6-fiber, 10-fiber)
 # ===========================================================================
 
-def step6_train_base_models(dry_run: bool, epochs: int) -> None:
+def step6_train_base_models(dry_run: bool, epochs: int, seeds: list[int]) -> None:
     """
     Train AttentionUNet from scratch on 6-fiber and 10-fiber datasets.
 
@@ -568,25 +577,28 @@ def step6_train_base_models(dry_run: bool, epochs: int) -> None:
 """)
 
     for nf in [6, 10]:
-        run(
-            f"python training/train_unet.py"
-            f"  --n_fibers {nf}"
-            f"  --arch attention_unet"
-            f"  --epochs {epochs}"
-            f"  --batch_size 16"
-            f"  --lr 1e-3"
-            f"  --alpha 0.7  --beta 0.3  --gamma 4.0"
-            f"  --dropout 0.1"
-            f"  --train_frac 0.80  --val_frac 0.10",
-            dry_run=dry_run
-        )
+        for seed in seeds:
+            run(
+                f"python training/train_unet.py"
+                f"  --n_fibers {nf}"
+                f"  --arch attention_unet"
+                f"  --epochs {epochs}"
+                f"  --batch_size 16"
+                f"  --lr 1e-3"
+                f"  --alpha 0.7  --beta 0.3  --gamma 4.0"
+                f"  --dropout 0.1"
+                f"  --train_frac 0.80  --val_frac 0.10"
+                f"  --seed {seed}"
+                f"  --run_name attention_unet_nf{nf}_scratch_seed{seed}",
+                dry_run=dry_run
+            )
 
 
 # ===========================================================================
 # Step 7  — Ablation: baseline U-Net (replicates reference paper)
 # ===========================================================================
 
-def step7_ablation(dry_run: bool, epochs: int) -> None:
+def step7_ablation(dry_run: bool, epochs: int, seeds: list[int]) -> None:
     """
     Ablation studies to isolate contributions of each enhancement.
 
@@ -626,16 +638,18 @@ def step7_ablation(dry_run: bool, epochs: int) -> None:
     for ab in ablations:
         print(f"\n  Running: {ab['desc']}")
         extra = ab.get("extra", "")
-        run(
-            f"python training/train_unet.py"
-            f"  --n_fibers 6"
-            f"  --arch {ab['arch']}"
-            f"  --epochs {epochs}"
-            f"  --alpha {ab['alpha']}  --beta {ab['beta']}"
-            f"  {extra}"
-            f"  --run_name {ab['tag']}_nf6",
-            dry_run=dry_run, check=False
-        )
+        for seed in seeds:
+            run(
+                f"python training/train_unet.py"
+                f"  --n_fibers 6"
+                f"  --arch {ab['arch']}"
+                f"  --epochs {epochs}"
+                f"  --alpha {ab['alpha']}  --beta {ab['beta']}"
+                f"  --seed {seed}"
+                f"  {extra}"
+                f"  --run_name {ab['tag']}_nf6_seed{seed}",
+                dry_run=dry_run, check=False
+            )
 
 
 # ===========================================================================
@@ -643,7 +657,7 @@ def step7_ablation(dry_run: bool, epochs: int) -> None:
 # ===========================================================================
 
 def step8_transfer_learning(dry_run: bool, epochs: int,
-                             unfreeze_epoch: int) -> None:
+                             unfreeze_epoch: int, seeds: list[int]) -> None:
     """
     Systematic transfer learning study.
 
@@ -682,38 +696,41 @@ def step8_transfer_learning(dry_run: bool, epochs: int,
 
     for pair in TRANSFER_PAIRS:
         src, tgt = pair["source"], pair["target"]
-        src_ckpt = checkpoint_path(src, "attention_unet", "scratch")
+        for seed in seeds:
+            src_ckpt = checkpoint_path(src, "attention_unet", "scratch", seed=seed)
 
-        if not os.path.exists(src_ckpt) and not dry_run:
-            print(f"  SKIP: pretrained checkpoint for {src}-fiber not found: {src_ckpt}")
-            continue
+            if not os.path.exists(src_ckpt) and not dry_run:
+                print(f"  SKIP: pretrained checkpoint for {src}-fiber not found: {src_ckpt}")
+                continue
 
-        for n_train in TRANSFER_TRAIN_SIZES:
-            # Scratch baseline for this data size
-            run(
-                f"python training/train_unet.py"
-                f"  --n_fibers {tgt}"
-                f"  --arch attention_unet"
-                f"  --epochs {epochs}"
-                f"  --train_samples {n_train}"
-                f"  --run_name attention_unet_nf{tgt}_scratch_n{n_train}",
-                dry_run=dry_run, check=False
-            )
-
-            # Transfer runs for each freezing strategy
-            for strategy in TRANSFER_STRATEGIES:
+            for n_train in TRANSFER_TRAIN_SIZES:
+                # Scratch baseline for this data size
                 run(
                     f"python training/train_unet.py"
                     f"  --n_fibers {tgt}"
                     f"  --arch attention_unet"
                     f"  --epochs {epochs}"
                     f"  --train_samples {n_train}"
-                    f"  --pretrained {src_ckpt}"
-                    f"  --transfer_strategy {strategy}"
-                    f"  --unfreeze_epoch {unfreeze_epoch}"
-                    f"  --run_name attention_unet_nf{tgt}_from_nf{src}_{strategy}_n{n_train}",
+                    f"  --seed {seed}"
+                    f"  --run_name attention_unet_nf{tgt}_scratch_n{n_train}_seed{seed}",
                     dry_run=dry_run, check=False
                 )
+
+                # Transfer runs for each freezing strategy
+                for strategy in TRANSFER_STRATEGIES:
+                    run(
+                        f"python training/train_unet.py"
+                        f"  --n_fibers {tgt}"
+                        f"  --arch attention_unet"
+                        f"  --epochs {epochs}"
+                        f"  --train_samples {n_train}"
+                        f"  --seed {seed}"
+                        f"  --pretrained {src_ckpt}"
+                        f"  --transfer_strategy {strategy}"
+                        f"  --unfreeze_epoch {unfreeze_epoch}"
+                        f"  --run_name attention_unet_nf{tgt}_from_nf{src}_{strategy}_n{n_train}_seed{seed}",
+                        dry_run=dry_run, check=False
+                    )
 
 
 # ===========================================================================
@@ -779,6 +796,33 @@ def step9_visualise_results(dry_run: bool) -> None:
 
 
 # ===========================================================================
+# Step 10 — Aggregate results and statistical reporting
+# ===========================================================================
+
+def step10_aggregate_reports(dry_run: bool, alpha: float) -> None:
+    """
+    Build consolidated result tables, confidence intervals, significance tests,
+    and per-fiber-system qualitative error figures.
+    """
+    banner("STEP 10 — Aggregate Results and Statistical Reporting")
+    print(f"""
+  Reporting outputs:
+    outputs/reports/all_runs.csv
+    outputs/reports/summary_metrics.csv
+    outputs/reports/significance_tests.csv
+    outputs/figures/qualitative_error_nf*.png
+
+  Statistical settings:
+    Confidence intervals: 95%%
+    Significance threshold: p < {alpha}
+""")
+    run(
+        f"python visualization/report_results.py --alpha {alpha}",
+        dry_run=dry_run, check=False
+    )
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -797,23 +841,31 @@ Steps:
   7  Ablation studies                   (Python + PyTorch)
   8  Transfer learning experiments      (Python + PyTorch)
   9  Visualise results                  (Python + PyTorch)
+ 10  Aggregate reports + statistics     (Python + PyTorch)
         """
     )
-    parser.add_argument("--start_step",     type=int, default=1, choices=range(1, 10),
+    parser.add_argument("--start_step",     type=int, default=1, choices=range(1, 11),
                         help="Start from this step (default: 1)")
-    parser.add_argument("--end_step",       type=int, default=9, choices=range(1, 10),
-                        help="Stop after this step (default: 9)")
+    parser.add_argument("--end_step",       type=int, default=10, choices=range(1, 11),
+                        help="Stop after this step (default: 10)")
     parser.add_argument("--skip_sim",       action="store_true",
                         help="Skip Steps 2+3 (ABAQUS simulation + extraction)")
     parser.add_argument("--skip_ablation",  action="store_true",
                         help="Skip Step 7 (ablation studies)")
+    parser.add_argument("--skip_reporting", action="store_true",
+                        help="Skip Step 10 (aggregate reporting)")
     parser.add_argument("--dry_run",        action="store_true",
                         help="Print all commands without executing them")
     parser.add_argument("--epochs",         type=int, default=100,
                         help="Training epochs (default: 100)")
     parser.add_argument("--unfreeze_epoch", type=int, default=20,
                         help="Epoch to unfreeze encoder in transfer learning (default: 20)")
+    parser.add_argument("--seeds", type=str, default="42,43,44",
+                        help="Comma-separated seeds for repeated runs (default: 42,43,44)")
+    parser.add_argument("--significance_alpha", type=float, default=0.05,
+                        help="Significance threshold for report tests (default: 0.05)")
     args = parser.parse_args()
+    seeds = parse_seed_list(args.seeds)
 
     # Force UTF-8 output so Unicode math symbols render on Windows terminals
     if hasattr(sys.stdout, "reconfigure"):
@@ -831,10 +883,11 @@ Steps:
         3: ("Stress Extraction from ODB",   lambda: step3_extract(args.dry_run)),
         4: ("Build 128×128 Datasets",       lambda: step4_build_datasets(args.dry_run)),
         5: ("Visualise FEM Data",           lambda: step5_visualise_data(args.dry_run)),
-        6: ("Train Base Models",            lambda: step6_train_base_models(args.dry_run, args.epochs)),
-        7: ("Ablation Studies",             lambda: step7_ablation(args.dry_run, args.epochs)),
-        8: ("Transfer Learning",            lambda: step8_transfer_learning(args.dry_run, args.epochs, args.unfreeze_epoch)),
+        6: ("Train Base Models",            lambda: step6_train_base_models(args.dry_run, args.epochs, seeds)),
+        7: ("Ablation Studies",             lambda: step7_ablation(args.dry_run, args.epochs, seeds)),
+        8: ("Transfer Learning",            lambda: step8_transfer_learning(args.dry_run, args.epochs, args.unfreeze_epoch, seeds)),
         9: ("Visualise Results",            lambda: step9_visualise_results(args.dry_run)),
+        10: ("Aggregate Reports",           lambda: step10_aggregate_reports(args.dry_run, args.significance_alpha)),
     }
 
     if args.skip_sim:
@@ -845,6 +898,9 @@ Steps:
     if args.skip_ablation:
         steps.pop(7, None)
         print("  [--skip_ablation] Skipping ablation studies.")
+    if args.skip_reporting:
+        steps.pop(10, None)
+        print("  [--skip_reporting] Skipping aggregate reporting.")
 
     active_steps = {k: v for k, v in steps.items()
                     if args.start_step <= k <= args.end_step}
